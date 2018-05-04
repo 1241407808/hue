@@ -57,7 +57,12 @@ except ImportError, e:
 try:
   from filebrowser.views import detect_parquet
 except ImportError, e:
-  LOG.warn('File Browser interfaces are not enabled')
+  LOG.warn('File Browser interface is not enabled')
+
+try:
+  from search.conf import SOLR_URL
+except ImportError, e:
+  LOG.warn('Solr Search interface is not enabled')
 
 
 def _escape_white_space_characters(s, inverse = False):
@@ -284,7 +289,9 @@ def importer_submit(request):
   if destination['ouputFormat'] in ('database', 'table'):
     destination['nonDefaultLocation'] = request.fs.netnormpath(destination['nonDefaultLocation']) if destination['nonDefaultLocation'] else destination['nonDefaultLocation']
 
-  if destination['ouputFormat'] == 'index':
+  if source['inputFormat'] == 'stream':
+    job_handle = _envelope_job(request, source, destination, start_time=start_time, lib_path=destination['indexerJobLibPath'])
+  elif destination['ouputFormat'] == 'index':
     source['columns'] = destination['columns']
     index_name = destination["name"]
 
@@ -299,8 +306,6 @@ def importer_submit(request):
   elif source['inputFormat'] == 'rdbms':
     if destination['outputFormat'] in ('file', 'table', 'hbase'):
       job_handle = run_sqoop(request, source, destination, start_time)
-  elif source['inputFormat'] == 'stream':
-    job_handle = _envelope_job(request, source, destination, start_time=start_time, lib_path=destination['indexerJobLibPath'])
   else:
     job_handle = _create_table(request, source, destination, start_time)
 
@@ -319,8 +324,6 @@ def importer_submit(request):
 
 
 def _small_indexing(user, fs, client, source, destination, index_name):
-  unique_key_field = destination['indexerPrimaryKey'] and destination['indexerPrimaryKey'][0] or None
-  df = destination['indexerDefaultField'] and destination['indexerDefaultField'][0] or None
   kwargs = {}
   errors = []
 
@@ -330,41 +333,9 @@ def _small_indexing(user, fs, client, source, destination, index_name):
       raise PopupException(_('File size is too large to handle!'))
 
   indexer = MorphlineIndexer(user, fs)
+
   fields = indexer.get_field_list(destination['columns'])
-  skip_fields = [field['name'] for field in fields if not field['keep']]
-
-  kwargs['fieldnames'] = ','.join([field['name'] for field in fields])
-  for field in fields:
-    for operation in field['operations']:
-      if operation['type'] == 'split':
-        field['multiValued'] = True # Solr requires multiValued to be set when splitting
-        kwargs['f.%(name)s.split' % field] = 'true'
-        kwargs['f.%(name)s.separator' % field] = operation['settings']['splitChar'] or ','
-
-  if skip_fields:
-    kwargs['skip'] = ','.join(skip_fields)
-    fields = [field for field in fields if field['name'] not in skip_fields]
-
-  if not unique_key_field:
-    unique_key_field = 'hue_id'
-    fields += [{"name": unique_key_field, "type": "string"}]
-    kwargs['rowid'] = unique_key_field
-
-  if not destination['hasHeader']:
-    kwargs['header'] = 'false'
-  else:
-    kwargs['skipLines'] = 1
-
-  if not client.exists(index_name):
-    client.create_index(
-        name=index_name,
-        config_name=destination.get('indexerConfigSet'),
-        fields=fields,
-        unique_key_field=unique_key_field,
-        df=df,
-        shards=destination['indexerNumShards'],
-        replication=destination['indexerReplicationFactor']
-    )
+  _create_solr_collection(user, fs, client, destination, index_name, kwargs)
 
   if source['inputFormat'] == 'file':
     data = fs.read(source["path"], 0, MAX_UPLOAD_SIZE)
@@ -521,11 +492,19 @@ def _envelope_job(request, file_format, destination, start_time=None, lib_path=N
         properties["kudu_master"] = manager.get_kudu_master()
       else:
         properties['output_table'] = collection_name
-
     elif destination['outputFormat'] == 'file':
       properties['path'] = file_format["path"]
       properties['format'] = file_format['tableFormat'] # or csv
-      
+    elif destination['outputFormat'] == 'index':
+      properties['collectionName'] = collection_name
+      properties['connection'] = SOLR_URL.get()
+      if destination['isTargetExisting']:
+        # Todo: check if format matches
+        pass
+      else:
+        client = SolrClient(request.user)
+        kwargs = {}
+        _create_solr_collection(request.user, request.fs, client, destination, collection_name, kwargs)
 
   properties["app_name"] = 'Data Ingest'
   properties["inputFormat"] = file_format['inputFormat']
@@ -535,3 +514,45 @@ def _envelope_job(request, file_format, destination, start_time=None, lib_path=N
   morphline = indexer.generate_config(properties)
 
   return indexer.run(request, collection_name, morphline, input_path, start_time=start_time, lib_path=lib_path)
+
+
+def _create_solr_collection(user, fs, client, destination, index_name, kwargs):
+  unique_key_field = destination['indexerPrimaryKey'] and destination['indexerPrimaryKey'][0] or None
+  df = destination['indexerDefaultField'] and destination['indexerDefaultField'][0] or None
+
+  indexer = MorphlineIndexer(user, fs)
+  fields = indexer.get_field_list(destination['columns'])
+  skip_fields = [field['name'] for field in fields if not field['keep']]
+
+  kwargs['fieldnames'] = ','.join([field['name'] for field in fields])
+  for field in fields:
+    for operation in field['operations']:
+      if operation['type'] == 'split':
+        field['multiValued'] = True # Solr requires multiValued to be set when splitting
+        kwargs['f.%(name)s.split' % field] = 'true'
+        kwargs['f.%(name)s.separator' % field] = operation['settings']['splitChar'] or ','
+
+  if skip_fields:
+    kwargs['skip'] = ','.join(skip_fields)
+    fields = [field for field in fields if field['name'] not in skip_fields]
+
+  if not unique_key_field:
+    unique_key_field = 'hue_id'
+    fields += [{"name": unique_key_field, "type": "string"}]
+    kwargs['rowid'] = unique_key_field
+
+  if not destination['hasHeader']:
+    kwargs['header'] = 'false'
+  else:
+    kwargs['skipLines'] = 1
+
+  if not client.exists(index_name):
+    client.create_index(
+        name=index_name,
+        config_name=destination.get('indexerConfigSet'),
+        fields=fields,
+        unique_key_field=unique_key_field,
+        df=df,
+        shards=destination['indexerNumShards'],
+        replication=destination['indexerReplicationFactor']
+    )
